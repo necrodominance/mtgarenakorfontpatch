@@ -10,7 +10,7 @@ import tempfile
 import zlib
 
 from .discovery import cab_member, ress_member, find_named_object
-from .dynamic_fonts import patch_dynamic_font_from_bytes
+from .dynamic_fonts import patch_dynamic_font_from_bytes, patch_font_asset_to_dynamic_facade
 from .embedded_schema import unity_font_source_root
 from .font_sources import (
     FontSelection,
@@ -46,6 +46,8 @@ VERSION = '1.0.4'
 UI_DEFAULT_TARGET = 'Font_Default_KR'
 UI_TITLE_TARGET = 'Font_Title_KR'
 DYN_DEFAULT_TARGET = 'Font_Default_KR_DynamicFallback'
+DYN_DEFAULT_PRIMARY_TARGET = 'Font_Default_DynamicFallback'
+BASE_DEFAULT_TARGET = 'Font_Default'
 DYN_TITLE_TARGET = 'Font_Title_KR_DynamicFallback'
 BOLD_TITLE_TARGET = 'Font_Title_RU_DynamicFallback'
 BELEREN_TITLE_NAME = 'Font_Title_DynamicFallback'
@@ -142,17 +144,27 @@ def patch_dynamic_container(
     bold_pptr = _pptr(sf, font_root, BOLD_TITLE_TARGET)
     beleren_pptr = _pptr(sf, font_root, BELEREN_TITLE_NAME)
 
+    # Patch both Default Dynamic slots. Font_Default itself will be converted
+    # into a primary Dynamic asset backed by the generic slot, while
+    # Font_Default_KR uses the KR slot. Keeping separate runtime atlases avoids
+    # two primary FontAssets competing for the same glyph packing state.
     out = patch_dynamic_font_from_bytes(
-        raw, font_root, DYN_DEFAULT_TARGET, prepared.default_bytes,
+        raw, font_root, DYN_DEFAULT_PRIMARY_TARGET, prepared.default_bytes,
         family=prepared.default_info.family, style=prepared.default_info.style,
         font_scale=default_scale, source_schema_root=source_root,
     )
-    # Leave MTGA's spare RU slot untouched. With no alternative italic face,
-    # TMP may apply its normal synthetic italic behavior to the selected Default
-    # font; more importantly, patching no longer generates or embeds a second TTF.
+    out = patch_font_weight_refs(
+        out, font_root, DYN_DEFAULT_PRIMARY_TARGET, {'m_FileID': 0, 'm_PathID': 0},
+        indices=(4, 7), regular=True, italic=True,
+    )
+    out = patch_dynamic_font_from_bytes(
+        out, font_root, DYN_DEFAULT_TARGET, prepared.default_bytes,
+        family=prepared.default_info.family, style=prepared.default_info.style,
+        font_scale=default_scale, source_schema_root=source_root,
+    )
     out = patch_font_weight_refs(
         out, font_root, DYN_DEFAULT_TARGET, {'m_FileID': 0, 'm_PathID': 0},
-        indices=(4, 7), regular=False, italic=True,
+        indices=(4, 7), regular=True, italic=True,
     )
 
     out = patch_dynamic_font_from_bytes(
@@ -176,21 +188,37 @@ def patch_dynamic_container(
 
 def patch_resources_container(
     resources_bytes: bytes,
-    shared_original: bytes,
+    shared_patched: bytes,
     font_root: TypeNode,
 ) -> bytes:
     resources_sf = parse_serialized_bytes(resources_bytes)
-    shared_sf = parse_serialized_bytes(shared_original)
+    shared_sf = parse_serialized_bytes(shared_patched)
     routes = _resolve_shared_ui_routes(resources_sf, shared_sf, font_root)
-    shared_file_id = int(routes['title_dynamic']['m_FileID'])
+    shared_file_id = int(routes['default_dynamic']['m_FileID'])
+
+    out = resources_bytes
+    # Some builds expose Font_Default in resources.assets while others only
+    # reference the card FontAsset. Convert it when present without making its
+    # absence fatal.
+    try:
+        find_named_object(resources_sf, font_root, BASE_DEFAULT_TARGET)
+    except RuntimeError:
+        pass
+    else:
+        out = patch_font_asset_to_dynamic_facade(
+            out, font_root, BASE_DEFAULT_TARGET, shared_patched,
+            DYN_DEFAULT_PRIMARY_TARGET, external_file_id=shared_file_id,
+        )
+    out = patch_font_asset_to_dynamic_facade(
+        out, font_root, UI_DEFAULT_TARGET, shared_patched,
+        DYN_DEFAULT_TARGET, external_file_id=shared_file_id,
+    )
+
+    # Title keeps the existing routing design: custom title Dynamic first and
+    # Beleren for the glyphs removed from the custom runtime subset.
+    shared_sf = parse_serialized_bytes(shared_patched)
     bold_obj = find_named_object(shared_sf, font_root, BOLD_TITLE_TARGET)
     bold = {'m_FileID': shared_file_id, 'm_PathID': int(bold_obj.path_id)}
-
-    out = patch_static_font_router(
-        resources_bytes, font_root, UI_DEFAULT_TARGET, [routes['default_dynamic']]
-    )
-    # Custom title Dynamic goes first. Its source is subset so Beleren-supported
-    # glyphs are absent, except pipe, causing natural fallback to Beleren.
     out = patch_static_font_router(
         out, font_root, UI_TITLE_TARGET,
         [routes['title_dynamic'], routes['beleren']],
@@ -201,28 +229,36 @@ def patch_resources_container(
 
 def patch_card_container(
     card_cab: bytes,
-    fonts_original_cab: bytes,
+    fonts_patched_cab: bytes,
     font_root: TypeNode,
 ) -> bytes:
     card_sf = parse_serialized_bytes(card_cab)
-    fonts_sf = parse_serialized_bytes(fonts_original_cab)
+    fonts_sf = parse_serialized_bytes(fonts_patched_cab)
+    fonts_primary_obj = find_named_object(fonts_sf, font_root, DYN_DEFAULT_PRIMARY_TARGET)
     fonts_default_obj = find_named_object(fonts_sf, font_root, DYN_DEFAULT_TARGET)
     fonts_title_obj = find_named_object(fonts_sf, font_root, DYN_TITLE_TARGET)
     fonts_bold_obj = find_named_object(fonts_sf, font_root, BOLD_TITLE_TARGET)
 
+    base_default_fields = _font_fields(card_sf, font_root, BASE_DEFAULT_TARGET)
     default_fields = _font_fields(card_sf, font_root, UI_DEFAULT_TARGET)
     title_fields = _font_fields(card_sf, font_root, UI_TITLE_TARGET)
-    card_dyn_default = _existing_fallback_pptr_by_path_id(default_fields, fonts_default_obj.path_id)
+    card_primary = _existing_fallback_pptr_by_path_id(
+        base_default_fields, fonts_primary_obj.path_id
+    )
+    card_dyn_default = _existing_fallback_pptr_by_path_id(
+        default_fields, fonts_default_obj.path_id
+    )
     card_dyn_title = _existing_fallback_pptr_by_path_id(title_fields, fonts_title_obj.path_id)
     card_bold = {'m_FileID': int(card_dyn_title['m_FileID']), 'm_PathID': int(fonts_bold_obj.path_id)}
     card_beleren = _local_font_pptr(card_sf, 'Font_Title', font_root)
 
-    out = patch_static_font_router(card_cab, font_root, UI_DEFAULT_TARGET, [card_dyn_default])
-    # Previous patch versions may have left explicit Default italic alternatives
-    # in the card FontAsset. Clear them so this build never depends on a generated face.
-    out = patch_font_weight_refs(
-        out, font_root, UI_DEFAULT_TARGET, {'m_FileID': 0, 'm_PathID': 0},
-        indices=(4, 7), regular=False, italic=True,
+    out = patch_font_asset_to_dynamic_facade(
+        card_cab, font_root, BASE_DEFAULT_TARGET, fonts_patched_cab,
+        DYN_DEFAULT_PRIMARY_TARGET, external_file_id=int(card_primary['m_FileID']),
+    )
+    out = patch_font_asset_to_dynamic_facade(
+        out, font_root, UI_DEFAULT_TARGET, fonts_patched_cab,
+        DYN_DEFAULT_TARGET, external_file_id=int(card_dyn_default['m_FileID']),
     )
     out = patch_static_font_router(
         out, font_root, UI_TITLE_TARGET,
@@ -264,22 +300,35 @@ def inspect_final_status(paths: InstallPaths) -> FinalStatus:
     bold_pptr = {'m_FileID': 0, 'm_PathID': int(bold_obj.path_id)}
     zero_pptr = {'m_FileID': 0, 'm_PathID': 0}
 
+    primary_fields = _font_fields(fonts_sf, font_root, DYN_DEFAULT_PRIMARY_TARGET)
     default_fields = _font_fields(fonts_sf, font_root, DYN_DEFAULT_TARGET)
     title_fields = _font_fields(fonts_sf, font_root, DYN_TITLE_TARGET)
+    card_base_default_fields = _font_fields(card_sf, font_root, BASE_DEFAULT_TARGET)
     card_default_fields = _font_fields(card_sf, font_root, UI_DEFAULT_TARGET)
     card_title_fields = _font_fields(card_sf, font_root, UI_TITLE_TARGET)
 
     return FinalStatus(
-        default_face=_face(fonts_sf, font_root, DYN_DEFAULT_TARGET),
+        default_face=_face(card_sf, font_root, BASE_DEFAULT_TARGET),
         title_face=_face(fonts_sf, font_root, DYN_TITLE_TARGET),
         title_bold_face=_face(fonts_sf, font_root, BOLD_TITLE_TARGET),
-        default_router_empty=not bool(card_default_fields.get('m_CharacterTable')),
+        default_router_empty=(
+            int(card_base_default_fields.get('m_AtlasPopulationMode', -1)) == 1
+            and int(card_default_fields.get('m_AtlasPopulationMode', -1)) == 1
+            and not bool(card_base_default_fields.get('m_CharacterTable'))
+            and not bool(card_base_default_fields.get('m_GlyphTable'))
+            and not bool(card_default_fields.get('m_CharacterTable'))
+            and not bool(card_default_fields.get('m_GlyphTable'))
+        ),
         title_router_empty=not bool(card_title_fields.get('m_CharacterTable')),
         default_italic_routes_clear=(
-            _weight_points_to(default_fields, zero_pptr, 4, italic_only=True)
-            and _weight_points_to(default_fields, zero_pptr, 7, italic_only=True)
-            and _weight_points_to(card_default_fields, zero_pptr, 4, italic_only=True)
-            and _weight_points_to(card_default_fields, zero_pptr, 7, italic_only=True)
+            _weight_points_to(primary_fields, zero_pptr, 4)
+            and _weight_points_to(primary_fields, zero_pptr, 7)
+            and _weight_points_to(default_fields, zero_pptr, 4)
+            and _weight_points_to(default_fields, zero_pptr, 7)
+            and _weight_points_to(card_base_default_fields, zero_pptr, 4)
+            and _weight_points_to(card_base_default_fields, zero_pptr, 7)
+            and _weight_points_to(card_default_fields, zero_pptr, 4)
+            and _weight_points_to(card_default_fields, zero_pptr, 7)
         ),
         title_bold_route_ok=_weight_points_to(title_fields, bold_pptr, 7),
     )
@@ -329,11 +378,11 @@ def build_final_patch(
     )
     _progress(progress, 'Static 폰트 라우터 수정 중…')
     patched_resources = patch_resources_container(
-        resources_original, shared_original, font_root,
+        resources_original, patched_shared, font_root,
     )
     _progress(progress, '카드 폰트 라우터 수정 중…')
     patched_card_cab = patch_card_container(
-        card_cab_member.data, fonts_original_cab, font_root,
+        card_cab_member.data, patched_fonts_cab, font_root,
     )
 
     _progress(progress, '패치 파일 작성 중…')
